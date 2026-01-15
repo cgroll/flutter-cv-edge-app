@@ -1,13 +1,49 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 
-void main() {
+List<CameraDescription> cameras = [];
+
+// Global YOLO model instance for preloading
+YOLO? globalYoloModel;
+bool isGlobalModelLoaded = false;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize cameras
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    debugPrint('Error initializing cameras: $e');
+  }
+
+  // Preload YOLO model in background
+  _preloadYoloModel();
+
   runApp(const MyApp());
+}
+
+Future<void> _preloadYoloModel() async {
+  try {
+    globalYoloModel = YOLO(
+      modelPath: 'yolo11n.tflite',
+      task: YOLOTask.detect,
+    );
+    await globalYoloModel!.loadModel();
+    isGlobalModelLoaded = true;
+    debugPrint('YOLO model preloaded successfully');
+  } catch (e) {
+    debugPrint('Error preloading YOLO model: $e');
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -38,6 +74,7 @@ class _HomePageState extends State<HomePage> {
 
   final List<Widget> _pages = const [
     SegmentationPage(),
+    CameraDetectionPage(),
     OcrPage(),
   ];
 
@@ -56,7 +93,12 @@ class _HomePageState extends State<HomePage> {
           NavigationDestination(
             icon: Icon(Icons.view_in_ar),
             selectedIcon: Icon(Icons.view_in_ar),
-            label: 'Segmentation',
+            label: 'Detection',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.videocam_outlined),
+            selectedIcon: Icon(Icons.videocam),
+            label: 'Live',
           ),
           NavigationDestination(
             icon: Icon(Icons.document_scanner_outlined),
@@ -70,7 +112,7 @@ class _HomePageState extends State<HomePage> {
 }
 
 // ============================================================================
-// Instance Segmentation Page
+// Object Detection Page
 // ============================================================================
 
 class SegmentationPage extends StatefulWidget {
@@ -85,40 +127,34 @@ class _SegmentationPageState extends State<SegmentationPage> {
   ui.Image? _decodedImage;
   List<YOLOResult> _detectionResults = [];
   bool _isProcessing = false;
-  bool _isModelLoaded = false;
   final ImagePicker _picker = ImagePicker();
-  YOLO? _yolo;
   int? _selectedResultIndex;
   double? _lastInferenceTimeSeconds;
+
+  // Use the preloaded global model
+  bool get _isModelLoaded => isGlobalModelLoaded;
+  YOLO? get _yolo => globalYoloModel;
 
   @override
   void initState() {
     super.initState();
-    _loadModel();
+    // Check if model is still loading
+    if (!isGlobalModelLoaded) {
+      _waitForModel();
+    }
   }
 
-  Future<void> _loadModel() async {
-    try {
-      _yolo = YOLO(
-        modelPath: 'yolo11n.tflite',
-        task: YOLOTask.detect,
-      );
-      await _yolo!.loadModel();
-      setState(() {
-        _isModelLoaded = true;
-      });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error loading model: $e')),
-        );
-      }
+  Future<void> _waitForModel() async {
+    // Poll until model is loaded
+    while (!isGlobalModelLoaded && mounted) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (mounted) setState(() {});
     }
   }
 
   @override
   void dispose() {
-    _yolo?.dispose();
+    // Model is global, don't dispose here
     super.dispose();
   }
 
@@ -281,7 +317,7 @@ class _SegmentationPageState extends State<SegmentationPage> {
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: const Text('Instance Segmentation'),
+        title: const Text('Object Detection'),
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
@@ -615,6 +651,631 @@ class DetectionPainter extends CustomPainter {
     return oldDelegate.image != image ||
         oldDelegate.results != results ||
         oldDelegate.selectedIndex != selectedIndex;
+  }
+}
+
+// ============================================================================
+// Camera Live Detection Page
+// ============================================================================
+
+class CameraDetectionPage extends StatefulWidget {
+  const CameraDetectionPage({super.key});
+
+  @override
+  State<CameraDetectionPage> createState() => _CameraDetectionPageState();
+}
+
+class _CameraDetectionPageState extends State<CameraDetectionPage> {
+  CameraController? _cameraController;
+  bool _isProcessing = false;
+  bool _isStreaming = false;
+  List<YOLOResult> _detectionResults = [];
+  ui.Image? _displayImage;
+  DateTime? _lastProcessedTime;
+  double _currentFps = 0;
+  CameraLensDirection _currentLensDirection = CameraLensDirection.back;
+  int _sensorOrientation = 0;
+
+  // Target 30 FPS = 33ms between frames
+  static const int _targetFrameIntervalMs = 33;
+
+  // Detection statistics
+  int _totalFramesProcessed = 0;
+  final Map<String, int> _classDetectionCounts = {};
+  final Map<String, List<double>> _classConfidences = {};
+  final List<double> _inferenceTimes = [];
+
+  bool get _isModelLoaded => isGlobalModelLoaded;
+  YOLO? get _yolo => globalYoloModel;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+    // Check if model is still loading
+    if (!isGlobalModelLoaded) {
+      _waitForModel();
+    }
+  }
+
+  Future<void> _waitForModel() async {
+    // Poll until model is loaded
+    while (!isGlobalModelLoaded && mounted) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    if (cameras.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No cameras available')),
+        );
+      }
+      return;
+    }
+
+    // Use the camera matching current lens direction, or first available
+    final camera = cameras.firstWhere(
+      (c) => c.lensDirection == _currentLensDirection,
+      orElse: () => cameras.first,
+    );
+
+    // Store sensor orientation for rotation correction
+    _sensorOrientation = camera.sensorOrientation;
+    debugPrint('Camera sensor orientation: $_sensorOrientation degrees');
+
+    _cameraController = CameraController(
+      camera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
+
+    try {
+      await _cameraController!.initialize();
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error initializing camera: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    // Stop streaming if active
+    final wasStreaming = _isStreaming;
+    if (wasStreaming) {
+      _stopStreaming();
+    }
+
+    // Dispose current controller
+    await _cameraController?.dispose();
+
+    // Toggle lens direction
+    setState(() {
+      _currentLensDirection = _currentLensDirection == CameraLensDirection.back
+          ? CameraLensDirection.front
+          : CameraLensDirection.back;
+      _displayImage = null;
+      _detectionResults = [];
+    });
+
+    // Initialize with new camera
+    await _initializeCamera();
+
+    // Resume streaming if it was active
+    if (wasStreaming && mounted) {
+      _startStreaming();
+    }
+  }
+
+  @override
+  void dispose() {
+    _stopStreaming();
+    _cameraController?.dispose();
+    // Model is global, don't dispose here
+    super.dispose();
+  }
+
+  void _startStreaming() {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+    if (!_isModelLoaded || _yolo == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Model is still loading...')),
+      );
+      return;
+    }
+
+    // Reset statistics
+    _totalFramesProcessed = 0;
+    _classDetectionCounts.clear();
+    _classConfidences.clear();
+    _inferenceTimes.clear();
+
+    setState(() {
+      _isStreaming = true;
+      _lastProcessedTime = DateTime.now();
+    });
+
+    _cameraController!.startImageStream(_onCameraFrame);
+  }
+
+  void _stopStreaming() {
+    if (_cameraController != null && _cameraController!.value.isStreamingImages) {
+      _cameraController!.stopImageStream();
+    }
+
+    // Print detection statistics
+    _printDetectionStatistics();
+
+    setState(() {
+      _isStreaming = false;
+      _isProcessing = false;
+    });
+  }
+
+  void _printDetectionStatistics() {
+    if (_totalFramesProcessed == 0) {
+      debugPrint('=== Detection Statistics ===');
+      debugPrint('No frames were processed.');
+      return;
+    }
+
+    debugPrint('=== Detection Statistics ===');
+    debugPrint('Total frames processed: $_totalFramesProcessed');
+    debugPrint('');
+
+    // Inference timing statistics
+    if (_inferenceTimes.isNotEmpty) {
+      final avgTime = _inferenceTimes.reduce((a, b) => a + b) / _inferenceTimes.length;
+      final minTime = _inferenceTimes.reduce((a, b) => a < b ? a : b);
+      final maxTime = _inferenceTimes.reduce((a, b) => a > b ? a : b);
+      debugPrint('Inference timing (incl. pre/post processing):');
+      debugPrint('  Average: ${avgTime.toStringAsFixed(1)} ms');
+      debugPrint('  Min: ${minTime.toStringAsFixed(1)} ms');
+      debugPrint('  Max: ${maxTime.toStringAsFixed(1)} ms');
+      debugPrint('');
+    }
+
+    debugPrint('Class detection counts:');
+
+    // Sort by detection count (descending)
+    final sortedEntries = _classDetectionCounts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    for (final entry in sortedEntries) {
+      final percentage = (entry.value / _totalFramesProcessed * 100).toStringAsFixed(1);
+      final confidences = _classConfidences[entry.key] ?? [];
+      final avgConfidence = confidences.isNotEmpty
+          ? (confidences.reduce((a, b) => a + b) / confidences.length * 100).toStringAsFixed(1)
+          : '0.0';
+      debugPrint('  ${entry.key}: ${entry.value}/$_totalFramesProcessed frames ($percentage%), avg confidence: $avgConfidence%');
+    }
+
+    if (_classDetectionCounts.isEmpty) {
+      debugPrint('  No objects detected in any frame.');
+    }
+    debugPrint('============================');
+  }
+
+  void _onCameraFrame(CameraImage cameraImage) {
+    // Always update the latest frame reference (for picking up most recent)
+    // We convert the CameraImage to bytes for processing
+    // Only process if not already processing (congestion control)
+    if (!_isProcessing && _isStreaming) {
+      _processFrame(cameraImage);
+    }
+  }
+
+  Future<void> _processFrame(CameraImage cameraImage) async {
+    if (!mounted || !_isStreaming) return;
+
+    // Check frame rate limiting (target 10 FPS)
+    final now = DateTime.now();
+    if (_lastProcessedTime != null) {
+      final elapsed = now.difference(_lastProcessedTime!).inMilliseconds;
+      if (elapsed < _targetFrameIntervalMs) {
+        return;
+      }
+    }
+
+    setState(() {
+      _isProcessing = true;
+    });
+
+    try {
+      final stopwatch = Stopwatch()..start();
+
+      // Convert CameraImage to JPEG bytes
+      final Uint8List? imageBytes = await _convertCameraImageToJpeg(cameraImage);
+      if (imageBytes == null) {
+        setState(() {
+          _isProcessing = false;
+        });
+        return;
+      }
+
+      // Decode for display
+      final codec = await ui.instantiateImageCodec(imageBytes);
+      final frame = await codec.getNextFrame();
+
+      // Run YOLO detection
+      final resultMap = await _yolo!.predict(imageBytes);
+
+      stopwatch.stop();
+      final inferenceTimeMs = stopwatch.elapsedMilliseconds.toDouble();
+      _inferenceTimes.add(inferenceTimeMs);
+
+      // Parse results (same logic as SegmentationPage)
+      final List<YOLOResult> results = [];
+      final rawBoxes = resultMap['boxes'] as List<dynamic>? ?? [];
+
+      for (final box in rawBoxes) {
+        final map = box as Map<String, dynamic>;
+
+        double left = 0, top = 0, right = 0, bottom = 0;
+
+        if (map.containsKey('x1')) {
+          left = (map['x1'] as num?)?.toDouble() ?? 0;
+          top = (map['y1'] as num?)?.toDouble() ?? 0;
+          right = (map['x2'] as num?)?.toDouble() ?? 0;
+          bottom = (map['y2'] as num?)?.toDouble() ?? 0;
+        } else if (map.containsKey('rect')) {
+          final rect = map['rect'];
+          if (rect is Map) {
+            left = (rect['left'] as num?)?.toDouble() ?? 0;
+            top = (rect['top'] as num?)?.toDouble() ?? 0;
+            right = (rect['right'] as num?)?.toDouble() ?? 0;
+            bottom = (rect['bottom'] as num?)?.toDouble() ?? 0;
+          }
+        } else if (map.containsKey('boundingBox')) {
+          final bbox = map['boundingBox'];
+          if (bbox is Map) {
+            left = (bbox['left'] as num?)?.toDouble() ?? 0;
+            top = (bbox['top'] as num?)?.toDouble() ?? 0;
+            right = (bbox['right'] as num?)?.toDouble() ?? 0;
+            bottom = (bbox['bottom'] as num?)?.toDouble() ?? 0;
+          }
+        }
+
+        double confidence = (map['confidence'] as num?)?.toDouble() ?? 0;
+        if (confidence > 1) {
+          confidence = confidence / 100.0;
+        }
+
+        final className = map['className'] as String? ??
+            map['label'] as String? ??
+            map['class'] as String? ??
+            'Unknown';
+        final classIndex = (map['classIndex'] as num?)?.toInt() ??
+            (map['index'] as num?)?.toInt() ?? 0;
+
+        final boundingBox = Rect.fromLTRB(left, top, right, bottom);
+
+        if (boundingBox.width > 0 && boundingBox.height > 0) {
+          results.add(YOLOResult(
+            classIndex: classIndex,
+            className: className,
+            confidence: confidence,
+            boundingBox: boundingBox,
+            normalizedBox: Rect.zero,
+          ));
+        }
+      }
+
+      // Filter by confidence threshold (35% for live detection to reduce flicker)
+      const double confidenceThreshold = 0.35;
+      final filteredResults = results.where((r) => r.confidence >= confidenceThreshold).toList();
+      filteredResults.sort((a, b) => b.confidence.compareTo(a.confidence));
+
+      // Update detection statistics
+      _totalFramesProcessed++;
+      // Track unique classes detected in this frame (count each class only once per frame)
+      final Set<String> classesInFrame = {};
+      for (final result in filteredResults) {
+        classesInFrame.add(result.className);
+        // Track confidence for averaging
+        _classConfidences.putIfAbsent(result.className, () => []);
+        _classConfidences[result.className]!.add(result.confidence);
+      }
+      for (final className in classesInFrame) {
+        _classDetectionCounts[className] = (_classDetectionCounts[className] ?? 0) + 1;
+      }
+
+      // Calculate FPS
+      final totalElapsed = now.difference(_lastProcessedTime!).inMilliseconds;
+      if (totalElapsed > 0) {
+        _currentFps = 1000.0 / totalElapsed;
+      }
+      _lastProcessedTime = now;
+
+      if (mounted) {
+        setState(() {
+          _displayImage = frame.image;
+          _detectionResults = filteredResults;
+          _isProcessing = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error processing frame: $e');
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+        });
+      }
+    }
+  }
+
+  Future<Uint8List?> _convertCameraImageToJpeg(CameraImage cameraImage) async {
+    try {
+      // For JPEG format (Android with imageFormatGroup: ImageFormatGroup.jpeg)
+      if (cameraImage.format.group == ImageFormatGroup.jpeg) {
+        return cameraImage.planes[0].bytes;
+      }
+
+      // For YUV420 format (common on Android), convert using image package
+      if (cameraImage.format.group == ImageFormatGroup.yuv420) {
+        return _convertYUV420ToJpeg(cameraImage);
+      }
+
+      // For BGRA format (iOS)
+      if (cameraImage.format.group == ImageFormatGroup.bgra8888) {
+        return _convertBGRA8888ToJpeg(cameraImage);
+      }
+
+      return null;
+    } catch (e) {
+      debugPrint('Error converting camera image: $e');
+      return null;
+    }
+  }
+
+  Uint8List? _convertYUV420ToJpeg(CameraImage cameraImage) {
+    try {
+      final int width = cameraImage.width;
+      final int height = cameraImage.height;
+
+      final yPlane = cameraImage.planes[0];
+      final uPlane = cameraImage.planes[1];
+      final vPlane = cameraImage.planes[2];
+
+      // Check pixel stride to determine format (NV21 vs YUV420)
+      final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+      final int uvRowStride = uPlane.bytesPerRow;
+
+      var image = img.Image(width: width, height: height);
+
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * yPlane.bytesPerRow + x;
+
+          // For NV21/NV12 format (interleaved UV), pixel stride is 2
+          // For YUV420 planar, pixel stride is 1
+          final int uvX = x ~/ 2;
+          final int uvY = y ~/ 2;
+          final int uvIndex = uvY * uvRowStride + uvX * uvPixelStride;
+
+          final int yValue = yPlane.bytes[yIndex];
+
+          // Read U and V values
+          int uValue, vValue;
+          if (uvPixelStride == 2) {
+            // NV21 format: V and U are interleaved
+            uValue = uPlane.bytes[uvIndex];
+            vValue = vPlane.bytes[uvIndex];
+          } else {
+            // Planar YUV420
+            uValue = uPlane.bytes[uvY * uPlane.bytesPerRow + uvX];
+            vValue = vPlane.bytes[uvY * vPlane.bytesPerRow + uvX];
+          }
+
+          // YUV to RGB conversion (BT.601 standard)
+          final int yVal = yValue - 16;
+          final int uVal = uValue - 128;
+          final int vVal = vValue - 128;
+
+          int r = ((298 * yVal + 409 * vVal + 128) >> 8).clamp(0, 255);
+          int g = ((298 * yVal - 100 * uVal - 208 * vVal + 128) >> 8).clamp(0, 255);
+          int b = ((298 * yVal + 516 * uVal + 128) >> 8).clamp(0, 255);
+
+          image.setPixelRgb(x, y, r, g, b);
+        }
+      }
+
+      // Apply rotation based on sensor orientation
+      if (_sensorOrientation == 90) {
+        image = img.copyRotate(image, angle: 90);
+      } else if (_sensorOrientation == 180) {
+        image = img.copyRotate(image, angle: 180);
+      } else if (_sensorOrientation == 270) {
+        image = img.copyRotate(image, angle: 270);
+      }
+
+      // Mirror for front camera
+      if (_currentLensDirection == CameraLensDirection.front) {
+        image = img.flipHorizontal(image);
+      }
+
+      // Encode to JPEG
+      return Uint8List.fromList(img.encodeJpg(image, quality: 85));
+    } catch (e) {
+      debugPrint('Error converting YUV420: $e');
+      return null;
+    }
+  }
+
+  Uint8List? _convertBGRA8888ToJpeg(CameraImage cameraImage) {
+    try {
+      final int width = cameraImage.width;
+      final int height = cameraImage.height;
+      final plane = cameraImage.planes[0];
+
+      final image = img.Image(width: width, height: height);
+
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int index = y * plane.bytesPerRow + x * 4;
+          final int b = plane.bytes[index];
+          final int g = plane.bytes[index + 1];
+          final int r = plane.bytes[index + 2];
+
+          image.setPixelRgb(x, y, r, g, b);
+        }
+      }
+
+      return Uint8List.fromList(img.encodeJpg(image, quality: 85));
+    } catch (e) {
+      debugPrint('Error converting BGRA8888: $e');
+      return null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Live Detection'),
+        actions: [
+          if (_isStreaming)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Center(
+                child: Text(
+                  '${_currentFps.toStringAsFixed(1)} FPS',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          // Camera switch button
+          if (cameras.length > 1)
+            IconButton(
+              onPressed: _cameraController?.value.isInitialized == true
+                  ? _switchCamera
+                  : null,
+              icon: Icon(
+                _currentLensDirection == CameraLensDirection.back
+                    ? Icons.camera_front
+                    : Icons.camera_rear,
+              ),
+              tooltip: 'Switch camera',
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Model status indicator
+          if (!_isModelLoaded)
+            Container(
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.orange[100],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Row(
+                children: [
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 12),
+                  Text('Loading YOLO model...'),
+                ],
+              ),
+            ),
+
+          // Camera preview with detections
+          Expanded(
+            child: _cameraController != null && _cameraController!.value.isInitialized
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // Show processed frame with detections if available
+                      if (_displayImage != null)
+                        CustomPaint(
+                          painter: DetectionPainter(
+                            image: _displayImage!,
+                            results: _detectionResults,
+                            selectedIndex: null,
+                          ),
+                          size: Size.infinite,
+                        )
+                      else
+                        // Show camera preview when not processing
+                        CameraPreview(_cameraController!),
+
+                      // Detection count overlay
+                      if (_isStreaming && _detectionResults.isNotEmpty)
+                        Positioned(
+                          top: 16,
+                          left: 16,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Text(
+                              '${_detectionResults.length} object(s)',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  )
+                : const Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        CircularProgressIndicator(),
+                        SizedBox(height: 16),
+                        Text('Initializing camera...'),
+                      ],
+                    ),
+                  ),
+          ),
+
+          // Controls
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _cameraController?.value.isInitialized == true && _isModelLoaded
+                        ? (_isStreaming ? _stopStreaming : _startStreaming)
+                        : null,
+                    icon: Icon(_isStreaming ? Icons.stop : Icons.play_arrow),
+                    label: Text(_isStreaming ? 'Stop' : 'Start Detection'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _isStreaming ? Colors.red : null,
+                      foregroundColor: _isStreaming ? Colors.white : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+        ],
+      ),
+    );
   }
 }
 

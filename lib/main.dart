@@ -89,6 +89,7 @@ class _SegmentationPageState extends State<SegmentationPage> {
   final ImagePicker _picker = ImagePicker();
   YOLO? _yolo;
   int? _selectedResultIndex;
+  double? _lastInferenceTimeSeconds;
 
   @override
   void initState() {
@@ -161,7 +162,10 @@ class _SegmentationPageState extends State<SegmentationPage> {
 
     try {
       final imageBytes = await _selectedImage!.readAsBytes();
+      final stopwatch = Stopwatch()..start();
       final resultMap = await _yolo!.predict(imageBytes);
+      stopwatch.stop();
+      final inferenceSeconds = stopwatch.elapsedMilliseconds / 1000.0;
       debugPrint('YOLO inference completed. Raw result keys: ${resultMap.keys.toList()}');
       debugPrint('Number of boxes: ${(resultMap['boxes'] as List?)?.length ?? 0}');
 
@@ -248,7 +252,17 @@ class _SegmentationPageState extends State<SegmentationPage> {
 
       setState(() {
         _detectionResults = filteredResults;
+        _lastInferenceTimeSeconds = inferenceSeconds;
       });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Detection completed in ${inferenceSeconds.toStringAsFixed(1)}s'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -621,6 +635,7 @@ class _OcrPageState extends State<OcrPage> {
   List<TextBlock> _textBlocks = [];
   bool _isProcessing = false;
   final ImagePicker _picker = ImagePicker();
+  double? _lastOcrTimeSeconds;
 
   Future<void> _pickImage() async {
     final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
@@ -651,15 +666,28 @@ class _OcrPageState extends State<OcrPage> {
       final inputImage = InputImage.fromFile(_selectedImage!);
       final textRecognizer =
           TextRecognizer(script: TextRecognitionScript.latin);
+      final stopwatch = Stopwatch()..start();
       final RecognizedText recognizedText =
           await textRecognizer.processImage(inputImage);
+      stopwatch.stop();
+      final ocrSeconds = stopwatch.elapsedMilliseconds / 1000.0;
 
       setState(() {
         _recognizedText = recognizedText.text;
         _textBlocks = recognizedText.blocks;
+        _lastOcrTimeSeconds = ocrSeconds;
       });
 
       await textRecognizer.close();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('OCR completed in ${ocrSeconds.toStringAsFixed(1)}s'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

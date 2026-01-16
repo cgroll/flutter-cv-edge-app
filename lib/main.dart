@@ -1643,9 +1643,11 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
       // Process each of the 200 detections
       final boxes = detsData[0]; // [200, 4]
       final labelProbs = labelsData[0]; // [200, 6]
+      final masks = masksData?[0]; // [200, 108, 108] if available
 
       // Debug: print first few raw boxes and labels to understand the format
       debugPrint('=== Raw detection data (first 5 with highest confidence) ===');
+      debugPrint('Masks available: ${masks != null}');
 
       // First, find detections with confidence and sort
       final List<Map<String, dynamic>> debugDetections = [];
@@ -1685,6 +1687,7 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         final double bestConf = d['bestConf'] as double;
         final int bestClass = d['bestClass'] as int;
         final List<double> box = d['box'] as List<double>;
+        final int detIndex = d['index'] as int;
 
         // Skip low confidence detections (raw confidence, not percentage)
         if (bestConf < 0.3) continue;
@@ -1713,12 +1716,18 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         // Skip invalid boxes
         if (x2 <= x1 || y2 <= y1) continue;
 
+        // Get the mask for this detection (keep at original 108x108 size for efficiency)
+        List<List<double>>? mask;
+        if (masks != null && detIndex < masks.length) {
+          mask = masks[detIndex]; // 108x108 mask
+        }
+
         results.add({
           'className': _getClassName(bestClass),
           'classIndex': bestClass,
           'confidence': _sigmoid(bestConf),
           'boundingBox': Rect.fromLTRB(x1, y1, x2, y2),
-          'polygon': null, // Skip polygon for now
+          'mask': mask, // Keep original 108x108 mask, painter will scale it
         });
       }
     } catch (e, stackTrace) {
@@ -1748,98 +1757,6 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         }).toList();
       }).toList();
     }).toList();
-  }
-
-  List<Offset>? _maskToPolygon(
-    List<List<double>> mask,
-    int maskSize,
-    Rect boxInModelCoords,
-    double scaleX,
-    double scaleY,
-  ) {
-    // Threshold the mask to get binary mask
-    const double threshold = 0.5;
-
-    // Find contour points using simple edge detection
-    final List<Offset> contourPoints = [];
-
-    for (int y = 1; y < maskSize - 1; y++) {
-      for (int x = 1; x < maskSize - 1; x++) {
-        final bool isAboveThreshold = mask[y][x] > threshold;
-
-        // Check if this is an edge pixel (above threshold but has neighbor below)
-        if (isAboveThreshold) {
-          final bool hasEdge = mask[y - 1][x] <= threshold ||
-              mask[y + 1][x] <= threshold ||
-              mask[y][x - 1] <= threshold ||
-              mask[y][x + 1] <= threshold;
-
-          if (hasEdge) {
-            // Convert mask coordinates to image coordinates
-            // Mask is relative to the bounding box
-            final double boxWidth = boxInModelCoords.width;
-            final double boxHeight = boxInModelCoords.height;
-
-            final double imgX = boxInModelCoords.left + (x / maskSize) * boxWidth;
-            final double imgY = boxInModelCoords.top + (y / maskSize) * boxHeight;
-
-            // Scale to original image coordinates
-            contourPoints.add(Offset(imgX * scaleX, imgY * scaleY));
-          }
-        }
-      }
-    }
-
-    if (contourPoints.isEmpty) return null;
-
-    // Sort points to form a proper polygon (angle-based sorting from centroid)
-    final double cx = contourPoints.map((p) => p.dx).reduce((a, b) => a + b) / contourPoints.length;
-    final double cy = contourPoints.map((p) => p.dy).reduce((a, b) => a + b) / contourPoints.length;
-
-    contourPoints.sort((a, b) {
-      final double a1 = _atan2(a.dy - cy, a.dx - cx);
-      final double a2 = _atan2(b.dy - cy, b.dx - cx);
-      return a1.compareTo(a2);
-    });
-
-    // Simplify polygon by taking every Nth point
-    final int step = (contourPoints.length / 50).ceil().clamp(1, 10);
-    final List<Offset> simplified = [];
-    for (int i = 0; i < contourPoints.length; i += step) {
-      simplified.add(contourPoints[i]);
-    }
-
-    return simplified.length >= 3 ? simplified : null;
-  }
-
-  double _atan2(double y, double x) {
-    // Manual atan2 implementation
-    if (x > 0) {
-      return _atan(y / x);
-    } else if (x < 0 && y >= 0) {
-      return _atan(y / x) + 3.14159265;
-    } else if (x < 0 && y < 0) {
-      return _atan(y / x) - 3.14159265;
-    } else if (x == 0 && y > 0) {
-      return 1.5707963;
-    } else if (x == 0 && y < 0) {
-      return -1.5707963;
-    }
-    return 0;
-  }
-
-  double _atan(double x) {
-    // Taylor series approximation for atan
-    if (x.abs() > 1) {
-      return (x > 0 ? 1.5707963 : -1.5707963) - _atan(1 / x);
-    }
-    double result = x;
-    double term = x;
-    for (int i = 1; i < 10; i++) {
-      term *= -x * x;
-      result += term / (2 * i + 1);
-    }
-    return result;
   }
 
   String _getClassName(int classIndex) {
@@ -2143,7 +2060,7 @@ class SegmentationPainter extends CustomPainter {
     canvas.scale(scale);
     canvas.drawImage(image, Offset.zero, Paint());
 
-    // Draw segmentation polygons and bounding boxes (only selected one if there's a selection)
+    // Draw segmentation masks (only selected one if there's a selection)
     for (int i = 0; i < results.length; i++) {
       // Skip non-selected items if one is selected
       if (selectedIndex != null && selectedIndex != i) {
@@ -2153,37 +2070,13 @@ class SegmentationPainter extends CustomPainter {
       final result = results[i];
       final color = _getColorForIndex(i);
       final rect = result['boundingBox'] as Rect;
-      final polygon = result['polygon'] as List<Offset>?;
+      final mask = result['mask'] as List<List<double>>?;
 
-      // Draw polygon if available
-      if (polygon != null && polygon.length >= 3) {
-        // Draw filled polygon with transparency
-        final fillPaint = Paint()
-          ..color = color.withOpacity(0.3)
-          ..style = PaintingStyle.fill;
-
-        final path = Path();
-        path.moveTo(polygon[0].dx, polygon[0].dy);
-        for (int j = 1; j < polygon.length; j++) {
-          path.lineTo(polygon[j].dx, polygon[j].dy);
-        }
-        path.close();
-        canvas.drawPath(path, fillPaint);
-
-        // Draw polygon outline
-        final strokePaint = Paint()
-          ..color = color
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 3.0 / scale
-          ..strokeJoin = StrokeJoin.round;
-        canvas.drawPath(path, strokePaint);
+      // Draw mask if available
+      if (mask != null && mask.isNotEmpty) {
+        _drawMask(canvas, mask, color, image.width, image.height);
       } else {
-        // Fallback to bounding box if no polygon
-        final fillPaint = Paint()
-          ..color = color.withOpacity(0.2)
-          ..style = PaintingStyle.fill;
-        canvas.drawRect(rect, fillPaint);
-
+        // Fallback to bounding box outline if no mask
         final boxPaint = Paint()
           ..color = color
           ..style = PaintingStyle.stroke
@@ -2191,7 +2084,7 @@ class SegmentationPainter extends CustomPainter {
         canvas.drawRect(rect, boxPaint);
       }
 
-      // Draw label background
+      // Draw label background at top of bounding box
       final labelBgPaint = Paint()
         ..color = color
         ..style = PaintingStyle.fill;
@@ -2228,6 +2121,63 @@ class SegmentationPainter extends CustomPainter {
     }
 
     canvas.restore();
+  }
+
+  /// Draw a segmentation mask as a semi-transparent overlay
+  void _drawMask(Canvas canvas, List<List<double>> mask, Color color, int imgWidth, int imgHeight) {
+    final int maskHeight = mask.length;
+    final int maskWidth = mask[0].length;
+
+    // Threshold for considering a pixel as part of the mask
+    const double threshold = 0.5;
+
+    // Scale factors from mask (108x108) to image coordinates
+    final double scaleX = imgWidth / maskWidth;
+    final double scaleY = imgHeight / maskHeight;
+
+    // Build a single path for the entire mask (much more efficient than many rectangles)
+    final Path fillPath = Path();
+
+    // Process row by row, creating horizontal spans for efficiency
+    for (int my = 0; my < maskHeight; my++) {
+      int? spanStart;
+
+      for (int mx = 0; mx <= maskWidth; mx++) {
+        bool isActive = false;
+        if (mx < maskWidth) {
+          // Apply sigmoid to convert logits to probabilities
+          final double logit = mask[my][mx];
+          final double prob = 1.0 / (1.0 + math.exp(-logit));
+          isActive = prob > threshold;
+        }
+
+        if (isActive && spanStart == null) {
+          // Start a new span
+          spanStart = mx;
+        } else if (!isActive && spanStart != null) {
+          // End the span, add rectangle to path
+          final double x = spanStart * scaleX;
+          final double y = my * scaleY;
+          final double w = (mx - spanStart) * scaleX;
+          final double h = scaleY;
+          fillPath.addRect(Rect.fromLTWH(x, y, w, h));
+          spanStart = null;
+        }
+      }
+    }
+
+    // Draw the filled mask with transparency
+    final fillPaint = Paint()
+      ..color = color.withOpacity(0.4)
+      ..style = PaintingStyle.fill;
+    canvas.drawPath(fillPath, fillPaint);
+
+    // Draw outline around the mask
+    final outlinePaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+    canvas.drawPath(fillPath, outlinePaint);
   }
 
   Color _getColorForIndex(int index) {

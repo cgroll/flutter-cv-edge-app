@@ -1772,133 +1772,151 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: const Text('Instance Segmentation'),
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Model status indicator
-            if (!_isModelLoaded)
-              Container(
-                padding: const EdgeInsets.all(12),
-                margin: const EdgeInsets.only(bottom: 16),
-                decoration: BoxDecoration(
-                  color: Colors.orange[100],
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Row(
-                  children: [
-                    SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    SizedBox(width: 12),
-                    Text('Loading RF-DETR model...'),
-                  ],
-                ),
-              ),
-
-            // Image display area with segmentation overlay
-            Container(
-              height: 350,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: _selectedImage != null && _decodedImage != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: CustomPaint(
-                        painter: SegmentationPainter(
-                          image: _decodedImage!,
-                          results: _segmentationResults,
-                          selectedIndex: _selectedResultIndex,
-                        ),
-                        size: Size.infinite,
-                      ),
-                    )
-                  : const Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.image, size: 64, color: Colors.grey),
-                          SizedBox(height: 8),
-                          Text('No image selected',
-                              style: TextStyle(color: Colors.grey)),
-                        ],
-                      ),
-                    ),
-            ),
-            const SizedBox(height: 16),
-
-            // Action buttons
-            Row(
+      body: Column(
+        children: [
+          // Fixed top section with image and buttons
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _pickImage,
-                    icon: const Icon(Icons.photo_library),
-                    label: const Text('Select Image'),
+                // Model status indicator
+                if (!_isModelLoaded)
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.orange[100],
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        SizedBox(width: 12),
+                        Text('Loading RF-DETR model...'),
+                      ],
+                    ),
                   ),
+
+                // Image display area with segmentation overlay
+                Container(
+                  height: 280,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: _selectedImage != null && _decodedImage != null
+                      ? ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: CustomPaint(
+                            painter: SegmentationPainter(
+                              image: _decodedImage!,
+                              results: _segmentationResults,
+                              selectedIndex: _selectedResultIndex,
+                            ),
+                            size: Size.infinite,
+                          ),
+                        )
+                      : const Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.image, size: 64, color: Colors.grey),
+                              SizedBox(height: 8),
+                              Text('No image selected',
+                                  style: TextStyle(color: Colors.grey)),
+                            ],
+                          ),
+                        ),
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed:
-                        _isProcessing || !_isModelLoaded ? null : _performSegmentation,
-                    icon: _isProcessing
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.auto_awesome),
-                    label: Text(_isProcessing ? 'Processing...' : 'Segment'),
-                  ),
+                const SizedBox(height: 12),
+
+                // Action buttons
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _pickImage,
+                        icon: const Icon(Icons.photo_library),
+                        label: const Text('Select Image'),
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed:
+                            _isProcessing || !_isModelLoaded ? null : _performSegmentation,
+                        icon: _isProcessing
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.auto_awesome),
+                        label: Text(_isProcessing ? 'Processing...' : 'Segment'),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
-            const SizedBox(height: 24),
+          ),
 
-            // Results section
-            if (_segmentationResults.isNotEmpty) ...[
-              Row(
-                children: [
-                  Text(
-                    '${_segmentationResults.length} object(s) detected:',
-                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  const Spacer(),
-                  if (_selectedResultIndex != null)
-                    TextButton(
-                      onPressed: () {
-                        setState(() {
-                          _selectedResultIndex = null;
-                        });
-                      },
-                      child: const Text('Show all'),
+          // Scrollable results section
+          Expanded(
+            child: _segmentationResults.isNotEmpty
+                ? Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              '${_segmentationResults.length} object(s) detected:',
+                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                            ),
+                            const Spacer(),
+                            if (_selectedResultIndex != null)
+                              TextButton(
+                                onPressed: () {
+                                  setState(() {
+                                    _selectedResultIndex = null;
+                                  });
+                                },
+                                child: const Text('Show all'),
+                              ),
+                            if (_lastInferenceTimeSeconds != null)
+                              Text(
+                                '${_lastInferenceTimeSeconds!.toStringAsFixed(2)}s',
+                                style: TextStyle(color: Colors.grey[600]),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        // Scrollable list of results
+                        Expanded(
+                          child: ListView(
+                            children: _buildResultsSections(),
+                          ),
+                        ),
+                      ],
                     ),
-                  if (_lastInferenceTimeSeconds != null)
-                    Text(
-                      '${_lastInferenceTimeSeconds!.toStringAsFixed(2)}s',
-                      style: TextStyle(color: Colors.grey[600]),
-                    ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              // Split results into Class 1 and other classes
-              ..._buildResultsSections(),
-            ] else if (_selectedImage != null && !_isProcessing) ...[
-              const Center(
-                child: Text(
-                  'Press Segment to find and segment objects in the image',
-                  style: TextStyle(color: Colors.grey),
-                ),
-              ),
-            ],
-          ],
-        ),
+                  )
+                : _selectedImage != null && !_isProcessing
+                    ? const Center(
+                        child: Text(
+                          'Press Segment to find and segment objects in the image',
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+          ),
+        ],
       ),
     );
   }

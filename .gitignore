@@ -53,3 +53,7 @@ app.*.map.json
 
 # Claude Code
 .claude/
+
+# Large model files
+*.onnx
+*.tflite

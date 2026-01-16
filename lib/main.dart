@@ -9,6 +9,8 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
+import 'package:onnxruntime/onnxruntime.dart';
+import 'package:flutter/services.dart' show rootBundle;
 
 List<CameraDescription> cameras = [];
 
@@ -75,6 +77,7 @@ class _HomePageState extends State<HomePage> {
   final List<Widget> _pages = const [
     SegmentationPage(),
     CameraDetectionPage(),
+    InstanceSegmentationPage(),
     OcrPage(),
   ];
 
@@ -99,6 +102,11 @@ class _HomePageState extends State<HomePage> {
             icon: Icon(Icons.videocam_outlined),
             selectedIcon: Icon(Icons.videocam),
             label: 'Live',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.auto_awesome_outlined),
+            selectedIcon: Icon(Icons.auto_awesome),
+            label: 'Segment',
           ),
           NavigationDestination(
             icon: Icon(Icons.document_scanner_outlined),
@@ -1276,6 +1284,856 @@ class _CameraDetectionPageState extends State<CameraDetectionPage> {
         ],
       ),
     );
+  }
+}
+
+// ============================================================================
+// Instance Segmentation Page (RF-DETR ONNX)
+// ============================================================================
+
+class InstanceSegmentationPage extends StatefulWidget {
+  const InstanceSegmentationPage({super.key});
+
+  @override
+  State<InstanceSegmentationPage> createState() => _InstanceSegmentationPageState();
+}
+
+class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
+  File? _selectedImage;
+  ui.Image? _decodedImage;
+  bool _isProcessing = false;
+  bool _isModelLoaded = false;
+  final ImagePicker _picker = ImagePicker();
+  double? _lastInferenceTimeSeconds;
+
+  OrtSession? _session;
+  List<Map<String, dynamic>> _segmentationResults = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadModel();
+  }
+
+  Future<void> _loadModel() async {
+    debugPrint('=== RF-DETR Model Loading Started ===');
+    final loadStopwatch = Stopwatch()..start();
+
+    try {
+      // Initialize ONNX Runtime environment
+      OrtEnv.instance.init();
+
+      // Load model from assets
+      final modelBytes = await rootBundle.load('assets/rfdetr_seg_uint8.onnx');
+      final bytes = modelBytes.buffer.asUint8List();
+
+      // Create session options
+      final sessionOptions = OrtSessionOptions();
+
+      // Create session from model bytes
+      _session = OrtSession.fromBuffer(bytes, sessionOptions);
+
+      loadStopwatch.stop();
+      final loadTimeSeconds = loadStopwatch.elapsedMilliseconds / 1000.0;
+
+      // Log model input/output info
+      debugPrint('=== RF-DETR Model Info ===');
+      debugPrint('Input names: ${_session!.inputNames}');
+      debugPrint('Output names: ${_session!.outputNames}');
+      debugPrint('Model loading time: ${loadTimeSeconds.toStringAsFixed(3)}s');
+
+      setState(() {
+        _isModelLoaded = true;
+      });
+      debugPrint('RF-DETR ONNX model loaded successfully');
+    } catch (e) {
+      loadStopwatch.stop();
+      debugPrint('Error loading RF-DETR model: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _session?.release();
+    super.dispose();
+  }
+
+  Future<void> _pickImage() async {
+    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+    if (image != null) {
+      final file = File(image.path);
+      final bytes = await file.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+
+      setState(() {
+        _selectedImage = file;
+        _decodedImage = frame.image;
+        _segmentationResults = [];
+      });
+    }
+  }
+
+  Future<void> _performSegmentation() async {
+    if (_selectedImage == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select an image first')),
+      );
+      return;
+    }
+
+    if (!_isModelLoaded || _session == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Model is still loading...')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isProcessing = true;
+      _segmentationResults = [];
+    });
+
+    debugPrint('=== RF-DETR Detection Started ===');
+    final totalStopwatch = Stopwatch()..start();
+
+    try {
+      // Load and preprocess the image
+      final preprocessStopwatch = Stopwatch()..start();
+      final imageBytes = await _selectedImage!.readAsBytes();
+      final decodedImg = img.decodeImage(imageBytes);
+
+      if (decodedImg == null) {
+        throw Exception('Failed to decode image');
+      }
+
+      // RF-DETR model expects 432x432 input - resize directly (no aspect ratio preservation)
+      const int targetSize = 432;
+      final resizedImg = img.copyResize(
+        decodedImg,
+        width: targetSize,
+        height: targetSize,
+        interpolation: img.Interpolation.linear,
+      );
+
+      // Convert to float tensor with normalization (0-255 to 0-1)
+      // RF-DETR expects NCHW format: [1, 3, 432, 432]
+      final int channels = 3;
+      final int height = targetSize;
+      final int width = targetSize;
+
+      // Model expects float input - normalize to 0-1 range
+      final inputData = Float32List(1 * channels * height * width);
+
+      int idx = 0;
+      // NCHW format: iterate channels first, then height, then width
+      for (int c = 0; c < channels; c++) {
+        for (int y = 0; y < height; y++) {
+          for (int x = 0; x < width; x++) {
+            final pixel = resizedImg.getPixel(x, y);
+            if (c == 0) {
+              inputData[idx] = pixel.r.toInt() / 255.0;
+            } else if (c == 1) {
+              inputData[idx] = pixel.g.toInt() / 255.0;
+            } else {
+              inputData[idx] = pixel.b.toInt() / 255.0;
+            }
+            idx++;
+          }
+        }
+      }
+
+      // Create input tensor
+      final inputShape = [1, channels, height, width];
+      final inputTensor = OrtValueTensor.createTensorWithDataList(
+        inputData,
+        inputShape,
+      );
+
+      preprocessStopwatch.stop();
+      final preprocessMs = preprocessStopwatch.elapsedMilliseconds;
+      debugPrint('Preprocessing time: ${preprocessMs}ms');
+
+      // Get input name from model
+      final inputName = _session!.inputNames.first;
+      final inputs = {inputName: inputTensor};
+
+      // Run inference
+      debugPrint('=== RF-DETR Inference Started ===');
+      final inferenceStopwatch = Stopwatch()..start();
+      final runOptions = OrtRunOptions();
+      final outputs = await _session!.runAsync(runOptions, inputs);
+      inferenceStopwatch.stop();
+      final inferenceMs = inferenceStopwatch.elapsedMilliseconds;
+
+      // Log raw outputs for debugging
+      debugPrint('=== RF-DETR Inference Results ===');
+      debugPrint('Inference time: ${inferenceMs}ms');
+      debugPrint('Number of outputs: ${outputs?.length ?? 0}');
+
+      if (outputs != null) {
+        for (int i = 0; i < outputs.length; i++) {
+          final output = outputs[i];
+          if (output != null) {
+            final outputName = _session!.outputNames[i];
+            debugPrint('Output $i ($outputName):');
+
+            if (output is OrtValueTensor) {
+              final data = output.value;
+              debugPrint('  Data type: ${data.runtimeType}');
+
+              // Print first few values for debugging
+              if (data is List) {
+                final shape = _inferShape(data);
+                debugPrint('  Inferred shape: $shape');
+                _printNestedList(data, '  ', maxDepth: 2, maxItems: 5);
+              }
+            }
+          }
+        }
+      }
+
+      // Parse the outputs - RF-DETR segmentation typically outputs:
+      // - boxes/scores/labels for detections
+      // - masks for segmentation
+      // Parse outputs
+      final postprocessStopwatch = Stopwatch()..start();
+      final parsedResults = _parseOutputs(outputs, decodedImg.width, decodedImg.height);
+      postprocessStopwatch.stop();
+      final postprocessMs = postprocessStopwatch.elapsedMilliseconds;
+
+      // Total time
+      totalStopwatch.stop();
+      final totalMs = totalStopwatch.elapsedMilliseconds;
+      final totalSeconds = totalMs / 1000.0;
+
+      debugPrint('Postprocessing time: ${postprocessMs}ms');
+      debugPrint('=== RF-DETR Detection Complete ===');
+      debugPrint('Total time: ${totalMs}ms (preprocess: ${preprocessMs}ms, inference: ${inferenceMs}ms, postprocess: ${postprocessMs}ms)');
+      debugPrint('Parsed ${parsedResults.length} segmentation results');
+      for (int i = 0; i < parsedResults.length; i++) {
+        final result = parsedResults[i];
+        debugPrint('  Result $i: class=${result['className']}, confidence=${result['confidence']}, bbox=${result['boundingBox']}');
+      }
+
+      // Clean up
+      inputTensor.release();
+      runOptions.release();
+      outputs?.forEach((output) => output?.release());
+
+      setState(() {
+        _segmentationResults = parsedResults;
+        _lastInferenceTimeSeconds = totalSeconds;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Segmentation completed in ${totalSeconds.toStringAsFixed(2)}s - ${parsedResults.length} objects found'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e, stackTrace) {
+      totalStopwatch.stop();
+      debugPrint('Error during segmentation: $e');
+      debugPrint('Stack trace: $stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error during segmentation: $e')),
+        );
+      }
+    } finally {
+      setState(() {
+        _isProcessing = false;
+      });
+    }
+  }
+
+  List<int> _inferShape(List data) {
+    final List<int> shape = [];
+    dynamic current = data;
+    while (current is List) {
+      shape.add(current.length);
+      if (current.isNotEmpty) {
+        current = current[0];
+      } else {
+        break;
+      }
+    }
+    return shape;
+  }
+
+  void _printNestedList(List data, String indent, {int maxDepth = 2, int maxItems = 5, int currentDepth = 0}) {
+    if (currentDepth >= maxDepth) {
+      debugPrint('$indent[... ${data.length} items]');
+      return;
+    }
+
+    final itemsToShow = data.length > maxItems ? maxItems : data.length;
+    for (int i = 0; i < itemsToShow; i++) {
+      final item = data[i];
+      if (item is List) {
+        debugPrint('$indent[$i]: List of ${item.length} items');
+        _printNestedList(item, '$indent  ', maxDepth: maxDepth, maxItems: maxItems, currentDepth: currentDepth + 1);
+      } else {
+        debugPrint('$indent[$i]: $item');
+      }
+    }
+    if (data.length > maxItems) {
+      debugPrint('$indent... and ${data.length - maxItems} more items');
+    }
+  }
+
+  List<Map<String, dynamic>> _parseOutputs(List<OrtValue?>? outputs, int originalWidth, int originalHeight) {
+    if (outputs == null || outputs.isEmpty) {
+      return [];
+    }
+
+    final List<Map<String, dynamic>> results = [];
+
+    // RF-DETR output format based on debug logs:
+    // - dets: [1, 200, 4] - bounding boxes
+    // - labels: [1, 200, 6] - class probabilities (6 classes)
+    // - masks: [1, 200, 108, 108] - segmentation masks
+
+    try {
+      List<List<List<double>>>? detsData;
+      List<List<List<double>>>? labelsData;
+      List<List<List<List<double>>>>? masksData;
+
+      for (int i = 0; i < outputs.length; i++) {
+        final output = outputs[i];
+        if (output == null) continue;
+
+        final outputName = _session!.outputNames[i];
+        if (output is OrtValueTensor) {
+          final data = output.value;
+          final shape = _inferShape(data as List);
+
+          debugPrint('Parsing output $outputName with shape $shape');
+
+          if (outputName == 'dets' || (shape.length == 3 && shape[2] == 4)) {
+            // [1, 200, 4] - bounding boxes
+            detsData = _convertToDouble3D(data);
+          } else if (outputName == 'labels' || (shape.length == 3 && shape[2] == 6)) {
+            // [1, 200, 6] - class probabilities
+            labelsData = _convertToDouble3D(data);
+          } else if (shape.length == 4 && shape[2] == 108 && shape[3] == 108) {
+            // [1, 200, 108, 108] - masks
+            masksData = _convertToDouble4D(data);
+          }
+        }
+      }
+
+      if (detsData == null || labelsData == null) {
+        debugPrint('Could not find dets or labels in outputs');
+        return results;
+      }
+
+      // Process each of the 200 detections
+      final boxes = detsData[0]; // [200, 4]
+      final labelProbs = labelsData[0]; // [200, 6]
+
+      // Debug: print first few raw boxes and labels to understand the format
+      debugPrint('=== Raw detection data (first 5 with highest confidence) ===');
+
+      // First, find detections with confidence and sort
+      final List<Map<String, dynamic>> debugDetections = [];
+      for (int i = 0; i < boxes.length; i++) {
+        final box = boxes[i];
+        final probs = labelProbs[i];
+
+        // Find best class
+        int bestClass = 0;
+        double bestConf = probs[0];
+        for (int c = 1; c < probs.length; c++) {
+          if (probs[c] > bestConf) {
+            bestConf = probs[c];
+            bestClass = c;
+          }
+        }
+
+        debugDetections.add({
+          'index': i,
+          'box': box,
+          'probs': probs,
+          'bestClass': bestClass,
+          'bestConf': bestConf,
+        });
+      }
+
+      // Sort by confidence and print top 5
+      debugDetections.sort((a, b) => (b['bestConf'] as double).compareTo(a['bestConf'] as double));
+      for (int i = 0; i < 5 && i < debugDetections.length; i++) {
+        final d = debugDetections[i];
+        debugPrint('Detection ${d['index']}: box=${d['box']}, probs=${d['probs']}, bestClass=${d['bestClass']}, bestConf=${d['bestConf']}');
+      }
+      debugPrint('Original image size: ${originalWidth}x${originalHeight}');
+
+      // Now process detections - skip low confidence
+      for (final d in debugDetections) {
+        final double bestConf = d['bestConf'] as double;
+        final int bestClass = d['bestClass'] as int;
+        final List<double> box = d['box'] as List<double>;
+
+        // Skip low confidence detections (raw confidence, not percentage)
+        if (bestConf < 0.3) continue;
+
+        // Box format needs to be determined - try different interpretations
+        // The raw values are very small (0.6, 1.3, 1.2, 2.6) so they might be:
+        // - Normalized 0-1 (multiply by image size)
+        // - Center x, center y, width, height format
+        // - Already in pixel coords for 432x432 input
+
+        // Try: assume box is [cx, cy, w, h] normalized to 0-1
+        // Convert to x1, y1, x2, y2 in original image coords
+        final double cx = box[0];
+        final double cy = box[1];
+        final double w = box[2];
+        final double h = box[3];
+
+        // If normalized, scale to original image
+        final double x1 = (cx - w / 2) * originalWidth;
+        final double y1 = (cy - h / 2) * originalHeight;
+        final double x2 = (cx + w / 2) * originalWidth;
+        final double y2 = (cy + h / 2) * originalHeight;
+
+        debugPrint('Converted box: cx=$cx, cy=$cy, w=$w, h=$h -> x1=$x1, y1=$y1, x2=$x2, y2=$y2');
+
+        // Skip invalid boxes
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        results.add({
+          'className': _getClassName(bestClass),
+          'classIndex': bestClass,
+          'confidence': bestConf,
+          'boundingBox': Rect.fromLTRB(x1, y1, x2, y2),
+          'polygon': null, // Skip polygon for now
+        });
+      }
+    } catch (e, stackTrace) {
+      debugPrint('Error parsing outputs: $e');
+      debugPrint('Stack trace: $stackTrace');
+    }
+
+    // Sort by confidence
+    results.sort((a, b) => (b['confidence'] as double).compareTo(a['confidence'] as double));
+
+    return results;
+  }
+
+  List<List<List<double>>> _convertToDouble3D(List data) {
+    return (data).map((batch) {
+      return (batch as List).map((item) {
+        return (item as List).map((v) => (v as double)).toList();
+      }).toList();
+    }).toList();
+  }
+
+  List<List<List<List<double>>>> _convertToDouble4D(List data) {
+    return (data).map((batch) {
+      return (batch as List).map((item) {
+        return (item as List).map((row) {
+          return (row as List).map((v) => (v as double)).toList();
+        }).toList();
+      }).toList();
+    }).toList();
+  }
+
+  List<Offset>? _maskToPolygon(
+    List<List<double>> mask,
+    int maskSize,
+    Rect boxInModelCoords,
+    double scaleX,
+    double scaleY,
+  ) {
+    // Threshold the mask to get binary mask
+    const double threshold = 0.5;
+
+    // Find contour points using simple edge detection
+    final List<Offset> contourPoints = [];
+
+    for (int y = 1; y < maskSize - 1; y++) {
+      for (int x = 1; x < maskSize - 1; x++) {
+        final bool isAboveThreshold = mask[y][x] > threshold;
+
+        // Check if this is an edge pixel (above threshold but has neighbor below)
+        if (isAboveThreshold) {
+          final bool hasEdge = mask[y - 1][x] <= threshold ||
+              mask[y + 1][x] <= threshold ||
+              mask[y][x - 1] <= threshold ||
+              mask[y][x + 1] <= threshold;
+
+          if (hasEdge) {
+            // Convert mask coordinates to image coordinates
+            // Mask is relative to the bounding box
+            final double boxWidth = boxInModelCoords.width;
+            final double boxHeight = boxInModelCoords.height;
+
+            final double imgX = boxInModelCoords.left + (x / maskSize) * boxWidth;
+            final double imgY = boxInModelCoords.top + (y / maskSize) * boxHeight;
+
+            // Scale to original image coordinates
+            contourPoints.add(Offset(imgX * scaleX, imgY * scaleY));
+          }
+        }
+      }
+    }
+
+    if (contourPoints.isEmpty) return null;
+
+    // Sort points to form a proper polygon (angle-based sorting from centroid)
+    final double cx = contourPoints.map((p) => p.dx).reduce((a, b) => a + b) / contourPoints.length;
+    final double cy = contourPoints.map((p) => p.dy).reduce((a, b) => a + b) / contourPoints.length;
+
+    contourPoints.sort((a, b) {
+      final double a1 = _atan2(a.dy - cy, a.dx - cx);
+      final double a2 = _atan2(b.dy - cy, b.dx - cx);
+      return a1.compareTo(a2);
+    });
+
+    // Simplify polygon by taking every Nth point
+    final int step = (contourPoints.length / 50).ceil().clamp(1, 10);
+    final List<Offset> simplified = [];
+    for (int i = 0; i < contourPoints.length; i += step) {
+      simplified.add(contourPoints[i]);
+    }
+
+    return simplified.length >= 3 ? simplified : null;
+  }
+
+  double _atan2(double y, double x) {
+    // Manual atan2 implementation
+    if (x > 0) {
+      return _atan(y / x);
+    } else if (x < 0 && y >= 0) {
+      return _atan(y / x) + 3.14159265;
+    } else if (x < 0 && y < 0) {
+      return _atan(y / x) - 3.14159265;
+    } else if (x == 0 && y > 0) {
+      return 1.5707963;
+    } else if (x == 0 && y < 0) {
+      return -1.5707963;
+    }
+    return 0;
+  }
+
+  double _atan(double x) {
+    // Taylor series approximation for atan
+    if (x.abs() > 1) {
+      return (x > 0 ? 1.5707963 : -1.5707963) - _atan(1 / x);
+    }
+    double result = x;
+    double term = x;
+    for (int i = 1; i < 10; i++) {
+      term *= -x * x;
+      result += term / (2 * i + 1);
+    }
+    return result;
+  }
+
+  String _getClassName(int classIndex) {
+    // Model class labels are unknown - just show the class index
+    // TODO: Add actual class labels if known for the rfdetr_seg_uint8.onnx model
+    return 'Class $classIndex';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Instance Segmentation'),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Model status indicator
+            if (!_isModelLoaded)
+              Container(
+                padding: const EdgeInsets.all(12),
+                margin: const EdgeInsets.only(bottom: 16),
+                decoration: BoxDecoration(
+                  color: Colors.orange[100],
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Row(
+                  children: [
+                    SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 12),
+                    Text('Loading RF-DETR model...'),
+                  ],
+                ),
+              ),
+
+            // Image display area with segmentation overlay
+            Container(
+              height: 350,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: _selectedImage != null && _decodedImage != null
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: CustomPaint(
+                        painter: SegmentationPainter(
+                          image: _decodedImage!,
+                          results: _segmentationResults,
+                        ),
+                        size: Size.infinite,
+                      ),
+                    )
+                  : const Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.image, size: 64, color: Colors.grey),
+                          SizedBox(height: 8),
+                          Text('No image selected',
+                              style: TextStyle(color: Colors.grey)),
+                        ],
+                      ),
+                    ),
+            ),
+            const SizedBox(height: 16),
+
+            // Action buttons
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _pickImage,
+                    icon: const Icon(Icons.photo_library),
+                    label: const Text('Select Image'),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed:
+                        _isProcessing || !_isModelLoaded ? null : _performSegmentation,
+                    icon: _isProcessing
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.auto_awesome),
+                    label: Text(_isProcessing ? 'Processing...' : 'Segment'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 24),
+
+            // Results section
+            if (_segmentationResults.isNotEmpty) ...[
+              Row(
+                children: [
+                  Text(
+                    '${_segmentationResults.length} object(s) detected:',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const Spacer(),
+                  if (_lastInferenceTimeSeconds != null)
+                    Text(
+                      '${_lastInferenceTimeSeconds!.toStringAsFixed(2)}s',
+                      style: TextStyle(color: Colors.grey[600]),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ListView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _segmentationResults.length,
+                itemBuilder: (context, index) {
+                  final result = _segmentationResults[index];
+                  final confidence = (result['confidence'] as double).clamp(0.0, 1.0);
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: _getColorForIndex(index),
+                        child: Text(
+                          '${index + 1}',
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                      title: Text(result['className'] as String),
+                      subtitle: Text(
+                        'Confidence: ${(confidence * 100).toStringAsFixed(1)}%',
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ] else if (_selectedImage != null && !_isProcessing) ...[
+              const Center(
+                child: Text(
+                  'Press Segment to find and segment objects in the image',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _getColorForIndex(int index) {
+    final colors = [
+      Colors.red,
+      Colors.blue,
+      Colors.green,
+      Colors.orange,
+      Colors.purple,
+      Colors.teal,
+      Colors.pink,
+      Colors.indigo,
+      Colors.amber,
+      Colors.cyan,
+    ];
+    return colors[index % colors.length];
+  }
+}
+
+// Custom painter to draw segmentation results on the image
+class SegmentationPainter extends CustomPainter {
+  final ui.Image image;
+  final List<Map<String, dynamic>> results;
+
+  SegmentationPainter({
+    required this.image,
+    required this.results,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // Calculate scale to fit image in canvas
+    final double scaleX = size.width / image.width;
+    final double scaleY = size.height / image.height;
+    final double scale = scaleX < scaleY ? scaleX : scaleY;
+
+    final double offsetX = (size.width - image.width * scale) / 2;
+    final double offsetY = (size.height - image.height * scale) / 2;
+
+    // Draw the image
+    canvas.save();
+    canvas.translate(offsetX, offsetY);
+    canvas.scale(scale);
+    canvas.drawImage(image, Offset.zero, Paint());
+
+    // Draw segmentation polygons and bounding boxes
+    for (int i = 0; i < results.length; i++) {
+      final result = results[i];
+      final color = _getColorForIndex(i);
+      final rect = result['boundingBox'] as Rect;
+      final polygon = result['polygon'] as List<Offset>?;
+
+      // Draw polygon if available
+      if (polygon != null && polygon.length >= 3) {
+        // Draw filled polygon with transparency
+        final fillPaint = Paint()
+          ..color = color.withOpacity(0.3)
+          ..style = PaintingStyle.fill;
+
+        final path = Path();
+        path.moveTo(polygon[0].dx, polygon[0].dy);
+        for (int j = 1; j < polygon.length; j++) {
+          path.lineTo(polygon[j].dx, polygon[j].dy);
+        }
+        path.close();
+        canvas.drawPath(path, fillPaint);
+
+        // Draw polygon outline
+        final strokePaint = Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.0 / scale
+          ..strokeJoin = StrokeJoin.round;
+        canvas.drawPath(path, strokePaint);
+      } else {
+        // Fallback to bounding box if no polygon
+        final fillPaint = Paint()
+          ..color = color.withOpacity(0.2)
+          ..style = PaintingStyle.fill;
+        canvas.drawRect(rect, fillPaint);
+
+        final boxPaint = Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.0 / scale;
+        canvas.drawRect(rect, boxPaint);
+      }
+
+      // Draw label background
+      final labelBgPaint = Paint()
+        ..color = color
+        ..style = PaintingStyle.fill;
+
+      final confidence = (result['confidence'] as double).clamp(0.0, 1.0);
+      final labelText = '${result['className']} ${(confidence * 100).toStringAsFixed(0)}%';
+      final textSpan = TextSpan(
+        text: labelText,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 14.0 / scale,
+          fontWeight: FontWeight.bold,
+        ),
+      );
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
+
+      final labelRect = Rect.fromLTWH(
+        rect.left,
+        rect.top - textPainter.height - 4 / scale,
+        textPainter.width + 8 / scale,
+        textPainter.height + 4 / scale,
+      );
+      canvas.drawRect(labelRect, labelBgPaint);
+
+      // Draw label text
+      textPainter.paint(
+        canvas,
+        Offset(rect.left + 4 / scale, rect.top - textPainter.height - 2 / scale),
+      );
+    }
+
+    canvas.restore();
+  }
+
+  Color _getColorForIndex(int index) {
+    final colors = [
+      Colors.red,
+      Colors.blue,
+      Colors.green,
+      Colors.orange,
+      Colors.purple,
+      Colors.teal,
+      Colors.pink,
+      Colors.indigo,
+      Colors.amber,
+      Colors.cyan,
+    ];
+    return colors[index % colors.length];
+  }
+
+  @override
+  bool shouldRepaint(covariant SegmentationPainter oldDelegate) {
+    return oldDelegate.image != image || oldDelegate.results != results;
   }
 }
 

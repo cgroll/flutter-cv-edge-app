@@ -44,6 +44,15 @@ dependencies:
   # Ultralytics YOLO for instance segmentation
   ultralytics_yolo: ^0.2.0
 
+  # Camera for real-time video stream
+  camera: ^0.11.0
+
+  # Image processing for YUV to JPEG conversion
+  image: ^4.3.0
+
+  # ONNX Runtime for running ONNX models
+  onnxruntime: ^1.4.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

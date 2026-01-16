@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -1308,6 +1309,12 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
 
   OrtSession? _session;
   List<Map<String, dynamic>> _segmentationResults = [];
+  int? _selectedResultIndex;
+
+  // Convert logit to probability using sigmoid function
+  double _sigmoid(double logit) {
+    return 1.0 / (1.0 + math.exp(-logit));
+  }
 
   @override
   void initState() {
@@ -1370,6 +1377,7 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         _selectedImage = file;
         _decodedImage = frame.image;
         _segmentationResults = [];
+        _selectedResultIndex = null;
       });
     }
   }
@@ -1392,6 +1400,7 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
     setState(() {
       _isProcessing = true;
       _segmentationResults = [];
+      _selectedResultIndex = null;
     });
 
     debugPrint('=== RF-DETR Detection Started ===');
@@ -1707,7 +1716,7 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
         results.add({
           'className': _getClassName(bestClass),
           'classIndex': bestClass,
-          'confidence': bestConf,
+          'confidence': _sigmoid(bestConf),
           'boundingBox': Rect.fromLTRB(x1, y1, x2, y2),
           'polygon': null, // Skip polygon for now
         });
@@ -1887,6 +1896,7 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
                         painter: SegmentationPainter(
                           image: _decodedImage!,
                           results: _segmentationResults,
+                          selectedIndex: _selectedResultIndex,
                         ),
                         size: Size.infinite,
                       ),
@@ -1943,6 +1953,15 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
                     style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   const Spacer(),
+                  if (_selectedResultIndex != null)
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _selectedResultIndex = null;
+                        });
+                      },
+                      child: const Text('Show all'),
+                    ),
                   if (_lastInferenceTimeSeconds != null)
                     Text(
                       '${_lastInferenceTimeSeconds!.toStringAsFixed(2)}s',
@@ -1951,31 +1970,8 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
                 ],
               ),
               const SizedBox(height: 8),
-              ListView.builder(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                itemCount: _segmentationResults.length,
-                itemBuilder: (context, index) {
-                  final result = _segmentationResults[index];
-                  final confidence = (result['confidence'] as double).clamp(0.0, 1.0);
-                  return Card(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: _getColorForIndex(index),
-                        child: Text(
-                          '${index + 1}',
-                          style: const TextStyle(color: Colors.white),
-                        ),
-                      ),
-                      title: Text(result['className'] as String),
-                      subtitle: Text(
-                        'Confidence: ${(confidence * 100).toStringAsFixed(1)}%',
-                      ),
-                    ),
-                  );
-                },
-              ),
+              // Split results into Class 1 and other classes
+              ..._buildResultsSections(),
             ] else if (_selectedImage != null && !_isProcessing) ...[
               const Center(
                 child: Text(
@@ -1985,6 +1981,118 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
               ),
             ],
           ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildResultsSections() {
+    final List<Widget> widgets = [];
+
+    // Separate Class 1 from other classes, keeping track of original indices
+    final List<MapEntry<int, Map<String, dynamic>>> class1Items = [];
+    final List<MapEntry<int, Map<String, dynamic>>> otherItems = [];
+
+    for (int i = 0; i < _segmentationResults.length; i++) {
+      final result = _segmentationResults[i];
+      final classIndex = result['classIndex'] as int;
+      if (classIndex == 1) {
+        class1Items.add(MapEntry(i, result));
+      } else {
+        otherItems.add(MapEntry(i, result));
+      }
+    }
+
+    // Sort Class 1 items by x coordinate (left to right)
+    class1Items.sort((a, b) {
+      final rectA = a.value['boundingBox'] as Rect;
+      final rectB = b.value['boundingBox'] as Rect;
+      return rectA.left.compareTo(rectB.left);
+    });
+
+    // Sort other items by y coordinate (top to bottom)
+    otherItems.sort((a, b) {
+      final rectA = a.value['boundingBox'] as Rect;
+      final rectB = b.value['boundingBox'] as Rect;
+      return rectA.top.compareTo(rectB.top);
+    });
+
+    // Build Class 1 section
+    if (class1Items.isNotEmpty) {
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 8, bottom: 4),
+          child: Text(
+            'Class 1 (${class1Items.length}):',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey[700],
+            ),
+          ),
+        ),
+      );
+      widgets.addAll(class1Items.map((entry) => _buildResultCard(entry.key, entry.value)));
+    }
+
+    // Build Other classes section
+    if (otherItems.isNotEmpty) {
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.only(top: 16, bottom: 4),
+          child: Text(
+            'Other Classes (${otherItems.length}):',
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey[700],
+            ),
+          ),
+        ),
+      );
+      widgets.addAll(otherItems.map((entry) => _buildResultCard(entry.key, entry.value)));
+    }
+
+    return widgets;
+  }
+
+  Widget _buildResultCard(int index, Map<String, dynamic> result) {
+    final confidence = (result['confidence'] as double).clamp(0.0, 1.0);
+    final isSelected = _selectedResultIndex == index;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      color: isSelected
+          ? _getColorForIndex(index).withOpacity(0.15)
+          : null,
+      shape: isSelected
+          ? RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(
+                color: _getColorForIndex(index),
+                width: 2,
+              ),
+            )
+          : null,
+      child: ListTile(
+        onTap: () {
+          setState(() {
+            _selectedResultIndex = isSelected ? null : index;
+          });
+        },
+        leading: CircleAvatar(
+          backgroundColor: _getColorForIndex(index),
+          child: Text(
+            '${index + 1}',
+            style: const TextStyle(color: Colors.white),
+          ),
+        ),
+        title: Text(result['className'] as String),
+        subtitle: Text(
+          'Confidence: ${(confidence * 100).toStringAsFixed(1)}%',
+        ),
+        trailing: Icon(
+          isSelected ? Icons.visibility : Icons.visibility_outlined,
+          color: isSelected ? _getColorForIndex(index) : Colors.grey,
         ),
       ),
     );
@@ -2011,10 +2119,12 @@ class _InstanceSegmentationPageState extends State<InstanceSegmentationPage> {
 class SegmentationPainter extends CustomPainter {
   final ui.Image image;
   final List<Map<String, dynamic>> results;
+  final int? selectedIndex;
 
   SegmentationPainter({
     required this.image,
     required this.results,
+    this.selectedIndex,
   });
 
   @override
@@ -2033,8 +2143,13 @@ class SegmentationPainter extends CustomPainter {
     canvas.scale(scale);
     canvas.drawImage(image, Offset.zero, Paint());
 
-    // Draw segmentation polygons and bounding boxes
+    // Draw segmentation polygons and bounding boxes (only selected one if there's a selection)
     for (int i = 0; i < results.length; i++) {
+      // Skip non-selected items if one is selected
+      if (selectedIndex != null && selectedIndex != i) {
+        continue;
+      }
+
       final result = results[i];
       final color = _getColorForIndex(i);
       final rect = result['boundingBox'] as Rect;
@@ -2133,7 +2248,9 @@ class SegmentationPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant SegmentationPainter oldDelegate) {
-    return oldDelegate.image != image || oldDelegate.results != results;
+    return oldDelegate.image != image ||
+        oldDelegate.results != results ||
+        oldDelegate.selectedIndex != selectedIndex;
   }
 }
 

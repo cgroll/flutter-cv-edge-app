@@ -53,6 +53,13 @@ dependencies:
   # ONNX Runtime for running ONNX models
   onnxruntime: ^1.4.1
 
+  # Flutter Map for OpenStreetMap display
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # Geolocator for location services
+  geolocator: ^12.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

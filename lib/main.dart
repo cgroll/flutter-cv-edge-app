@@ -12,6 +12,9 @@ import 'package:image_picker/image_picker.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:geolocator/geolocator.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -80,6 +83,7 @@ class _HomePageState extends State<HomePage> {
     CameraDetectionPage(),
     InstanceSegmentationPage(),
     OcrPage(),
+    MapPage(),
   ];
 
   @override
@@ -113,6 +117,11 @@ class _HomePageState extends State<HomePage> {
             icon: Icon(Icons.document_scanner_outlined),
             selectedIcon: Icon(Icons.document_scanner),
             label: 'OCR',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.map_outlined),
+            selectedIcon: Icon(Icons.map),
+            label: 'Map',
           ),
         ],
       ),
@@ -2154,7 +2163,7 @@ class SegmentationPainter extends CustomPainter {
     final double scaleY = imgHeight / maskHeight;
 
     // Build a single path for the entire mask (much more efficient than many rectangles)
-    final Path fillPath = Path();
+    final ui.Path fillPath = ui.Path();
 
     // Process row by row, creating horizontal spans for efficiency
     for (int my = 0; my < maskHeight; my++) {
@@ -2461,5 +2470,530 @@ class _OcrPageState extends State<OcrPage> {
         ),
       ),
     );
+  }
+}
+
+// ============================================================================
+// Map Page
+// ============================================================================
+
+class MapPage extends StatefulWidget {
+  const MapPage({super.key});
+
+  @override
+  State<MapPage> createState() => _MapPageState();
+}
+
+// Data class for Munich points
+class MunichPoint {
+  final String id;
+  final LatLng position;
+
+  MunichPoint({
+    required this.id,
+    required this.position,
+  });
+}
+
+class _MapPageState extends State<MapPage> {
+  final MapController _mapController = MapController();
+  bool _isLoading = false;
+  bool _dataLoaded = false;
+  Position? _userPosition;
+  final List<MunichPoint> _munichPoints = [];
+  final List<Marker> _markers = [];
+  final math.Random _random = math.Random();
+  MunichPoint? _selectedPoint;
+  OverlayEntry? _tooltipOverlay;
+
+  // Munich center coordinates
+  static const double _munichCenterLat = 48.1351;
+  static const double _munichCenterLng = 11.5820;
+  static const double _munichRadius = 0.15; // Approximate radius in degrees
+
+  @override
+  void initState() {
+    super.initState();
+    // Load data when the page is first created
+    _loadData();
+  }
+
+  Future<void> _loadData() async {
+    if (_dataLoaded) return;
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // Generate 50 random points in Munich
+      _generateMunichPoints();
+
+      // Get user location
+      await _getUserLocation();
+
+      // Create markers
+      _createMarkers();
+
+      setState(() {
+        _dataLoaded = true;
+        _isLoading = false;
+      });
+    } catch (e) {
+      debugPrint('Error loading map data: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error loading map data: $e')),
+        );
+      }
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  String _generateRandomId() {
+    // Generate a random ID (e.g., "PT-12345")
+    final int randomNum = _random.nextInt(99999);
+    return 'PT-${randomNum.toString().padLeft(5, '0')}';
+  }
+
+  void _generateMunichPoints() {
+    _munichPoints.clear();
+    for (int i = 0; i < 50; i++) {
+      // Generate random point within Munich area
+      // Using a simple approach: random offset from center
+      final double latOffset = (_random.nextDouble() - 0.5) * 2 * _munichRadius;
+      final double lngOffset = (_random.nextDouble() - 0.5) * 2 * _munichRadius;
+      
+      final double lat = _munichCenterLat + latOffset;
+      final double lng = _munichCenterLng + lngOffset;
+      
+      final String id = _generateRandomId();
+      _munichPoints.add(MunichPoint(
+        id: id,
+        position: LatLng(lat, lng),
+      ));
+    }
+    debugPrint('Generated ${_munichPoints.length} random points in Munich');
+  }
+
+  Future<void> _getUserLocation() async {
+    try {
+      // Check if location services are enabled
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        debugPrint('Location services are disabled');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location services are disabled. Please enable them in settings.'),
+            ),
+          );
+        }
+        return;
+      }
+
+      // Check location permissions
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          debugPrint('Location permissions are denied');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Location permissions are denied. Please enable them in settings.'),
+              ),
+            );
+          }
+          return;
+        }
+      }
+
+      if (permission == LocationPermission.deniedForever) {
+        debugPrint('Location permissions are permanently denied');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location permissions are permanently denied. Please enable them in app settings.'),
+            ),
+          );
+        }
+        return;
+      }
+
+      // Get current position
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+
+      setState(() {
+        _userPosition = position;
+      });
+      debugPrint('User location: ${position.latitude}, ${position.longitude}');
+    } catch (e) {
+      debugPrint('Error getting user location: $e');
+      // Don't show error to user if location fails - just continue without it
+    }
+  }
+
+  void _createMarkers() {
+    _markers.clear();
+
+    // Add markers for Munich points
+    for (int i = 0; i < _munichPoints.length; i++) {
+      final munichPoint = _munichPoints[i];
+      _markers.add(
+        Marker(
+          point: munichPoint.position,
+          width: 60,
+          height: 60,
+          child: Icon(
+            Icons.location_on,
+            color: Colors.blue,
+            size: 60,
+          ),
+        ),
+      );
+    }
+
+    // Add marker for user location if available
+    if (_userPosition != null) {
+      final userLatLng = LatLng(_userPosition!.latitude, _userPosition!.longitude);
+      _markers.add(
+        Marker(
+          point: userLatLng,
+          width: 70,
+          height: 70,
+          child: Icon(
+            Icons.my_location,
+            color: Colors.red,
+            size: 70,
+          ),
+        ),
+      );
+    }
+  }
+
+  void _showTooltip(MunichPoint point) {
+    setState(() {
+      _selectedPoint = point;
+    });
+
+    // Remove existing tooltip if any
+    _hideTooltip();
+
+    // Show tooltip using a dialog or overlay
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (BuildContext context) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(20),
+          child: Stack(
+            children: [
+              Positioned(
+                child: Material(
+                  color: Colors.transparent,
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.2),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              'Point Information',
+                              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.close, size: 20),
+                              onPressed: () {
+                                Navigator.of(context).pop();
+                                setState(() {
+                                  _selectedPoint = null;
+                                });
+                              },
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        _buildInfoRow('ID', point.id),
+                        _buildInfoRow('Latitude', point.position.latitude.toStringAsFixed(6)),
+                        _buildInfoRow('Longitude', point.position.longitude.toStringAsFixed(6)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    ).then((_) {
+      setState(() {
+        _selectedPoint = null;
+      });
+    });
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 80,
+            child: Text(
+              '$label:',
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: Colors.grey[700],
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _hideTooltip() {
+    if (_tooltipOverlay != null) {
+      _tooltipOverlay!.remove();
+      _tooltipOverlay = null;
+    }
+  }
+
+  void _fitBounds() {
+    if (_markers.isEmpty && _munichPoints.isEmpty) return;
+
+    // Collect all points
+    final List<LatLng> allPoints = _munichPoints.map((p) => p.position).toList();
+    if (_userPosition != null) {
+      allPoints.add(LatLng(_userPosition!.latitude, _userPosition!.longitude));
+    }
+
+    if (allPoints.isEmpty) return;
+
+    // Calculate bounds to include all points
+    double minLat = double.infinity;
+    double maxLat = -double.infinity;
+    double minLng = double.infinity;
+    double maxLng = -double.infinity;
+
+    for (final point in allPoints) {
+      minLat = math.min(minLat, point.latitude);
+      maxLat = math.max(maxLat, point.latitude);
+      minLng = math.min(minLng, point.longitude);
+      maxLng = math.max(maxLng, point.longitude);
+    }
+
+    // Calculate center and zoom level
+    final center = LatLng(
+      (minLat + maxLat) / 2,
+      (minLng + maxLng) / 2,
+    );
+
+    // Calculate zoom level based on bounds
+    final latDiff = maxLat - minLat;
+    final lngDiff = maxLng - minLng;
+    final maxDiff = math.max(latDiff, lngDiff);
+    
+    // Approximate zoom calculation
+    double zoom = 12.0;
+    if (maxDiff > 0.1) {
+      zoom = 10.0;
+    } else if (maxDiff > 0.05) {
+      zoom = 11.0;
+    } else if (maxDiff > 0.02) {
+      zoom = 12.0;
+    } else if (maxDiff > 0.01) {
+      zoom = 13.0;
+    } else {
+      zoom = 14.0;
+    }
+
+    _mapController.move(center, zoom);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Map'),
+        actions: [
+          if (_dataLoaded)
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () {
+                setState(() {
+                  _dataLoaded = false;
+                });
+                _loadData();
+              },
+              tooltip: 'Reload data',
+            ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          // Map
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: LatLng(_munichCenterLat, _munichCenterLng),
+              initialZoom: 12.0,
+              onMapReady: () {
+                // If data is loaded, fit bounds to show all markers
+                if (_dataLoaded && _markers.isNotEmpty) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _fitBounds();
+                  });
+                }
+              },
+              onTap: (tapPosition, point) {
+                // Check if tap is on a Munich point marker
+                // Use a threshold in degrees (approximately 150 meters for larger markers)
+                const double threshold = 0.0015;
+                MunichPoint? closestPoint;
+                double closestDistance = double.infinity;
+
+                for (final munichPoint in _munichPoints) {
+                  // Calculate simple distance in degrees
+                  final double latDiff = (point.latitude - munichPoint.position.latitude).abs();
+                  final double lngDiff = (point.longitude - munichPoint.position.longitude).abs();
+                  final double distance = math.sqrt(latDiff * latDiff + lngDiff * lngDiff);
+                  
+                  if (distance < threshold && distance < closestDistance) {
+                    closestPoint = munichPoint;
+                    closestDistance = distance;
+                  }
+                }
+
+                if (closestPoint != null) {
+                  _showTooltip(closestPoint);
+                }
+              },
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.flutter_cv_edge_app',
+              ),
+              MarkerLayer(
+                markers: _markers,
+              ),
+            ],
+          ),
+          // Loading indicator
+          if (_isLoading)
+            Container(
+              color: Colors.black.withOpacity(0.3),
+              child: const Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 16),
+                    Text(
+                      'Loading map data...',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          // Info overlay
+          if (_dataLoaded && !_isLoading)
+            Positioned(
+              top: 16,
+              left: 16,
+              right: 16,
+              child: Card(
+                elevation: 4,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Map Data Loaded',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.bold,
+                            ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text('Munich points: ${_munichPoints.length}'),
+                      Text(
+                        _userPosition != null
+                            ? 'Your location: ${_userPosition!.latitude.toStringAsFixed(4)}, ${_userPosition!.longitude.toStringAsFixed(4)}'
+                            : 'Your location: Not available',
+                      ),
+                      if (_selectedPoint != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          'Selected: ${_selectedPoint!.id}',
+                          style: TextStyle(
+                            color: Colors.blue[700],
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+      floatingActionButton: _dataLoaded && !_isLoading
+          ? FloatingActionButton(
+              onPressed: _fitBounds,
+              tooltip: 'Fit all markers',
+              child: const Icon(Icons.fit_screen),
+            )
+          : null,
+    );
+  }
+
+  @override
+  void dispose() {
+    _hideTooltip();
+    _mapController.dispose();
+    super.dispose();
   }
 }

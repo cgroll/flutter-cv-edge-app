@@ -60,6 +60,12 @@ dependencies:
   # Geolocator for location services
   geolocator: ^12.0.0
 
+  # Drift for SQLite database
+  drift: ^2.14.1
+  sqlite3_flutter_libs: ^0.5.18
+  path_provider: ^2.1.1
+  path: ^1.8.3
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -70,6 +76,10 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+  # Drift code generator
+  drift_dev: ^2.14.1
+  build_runner: ^2.4.7
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

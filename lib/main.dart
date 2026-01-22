@@ -15,6 +15,9 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+import 'database/database.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -83,6 +86,7 @@ class _HomePageState extends State<HomePage> {
     CameraDetectionPage(),
     InstanceSegmentationPage(),
     OcrPage(),
+    DataLoaderPage(),
     MapPage(),
   ];
 
@@ -117,6 +121,11 @@ class _HomePageState extends State<HomePage> {
             icon: Icon(Icons.document_scanner_outlined),
             selectedIcon: Icon(Icons.document_scanner),
             label: 'OCR',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.download_outlined),
+            selectedIcon: Icon(Icons.download),
+            label: 'Data',
           ),
           NavigationDestination(
             icon: Icon(Icons.map_outlined),
@@ -2505,8 +2514,10 @@ class _MapPageState extends State<MapPage> {
   final math.Random _random = math.Random();
   MunichPoint? _selectedPoint;
   OverlayEntry? _tooltipOverlay;
+  AppDatabase? _database;
+  bool _usingCachedData = false;
 
-  // Munich center coordinates
+  // Munich center coordinates (fallback)
   static const double _munichCenterLat = 48.1351;
   static const double _munichCenterLng = 11.5820;
   static const double _munichRadius = 0.15; // Approximate radius in degrees
@@ -2514,8 +2525,25 @@ class _MapPageState extends State<MapPage> {
   @override
   void initState() {
     super.initState();
+    _initializeDatabase();
     // Load data when the page is first created
     _loadData();
+  }
+
+  Future<void> _initializeDatabase() async {
+    try {
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'data_points.db'));
+      
+      if (await file.exists()) {
+        _database = AppDatabase();
+        setState(() {
+          _usingCachedData = true;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error initializing database: $e');
+    }
   }
 
   Future<void> _loadData() async {
@@ -2526,11 +2554,16 @@ class _MapPageState extends State<MapPage> {
     });
 
     try {
-      // Generate 50 random points in Munich
-      _generateMunichPoints();
-
-      // Get user location
+      // Get user location first
       await _getUserLocation();
+
+      // Try to load from cached database
+      if (_database != null && _userPosition != null) {
+        await _loadFromDatabase();
+      } else {
+        // Fallback to generating random Munich points
+        _generateMunichPoints();
+      }
 
       // Create markers
       _createMarkers();
@@ -2548,6 +2581,36 @@ class _MapPageState extends State<MapPage> {
       }
       setState(() {
         _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadFromDatabase() async {
+    if (_database == null || _userPosition == null) return;
+
+    try {
+      // Get closest 50 points to user location
+      final closestPoints = await _database!.getClosestPoints(
+        _userPosition!.latitude,
+        _userPosition!.longitude,
+        50,
+      );
+
+      _munichPoints.clear();
+      for (final point in closestPoints) {
+        _munichPoints.add(MunichPoint(
+          id: point.pointId,
+          position: LatLng(point.latitude, point.longitude),
+        ));
+      }
+
+      debugPrint('Loaded ${_munichPoints.length} closest points from database');
+    } catch (e) {
+      debugPrint('Error loading from database: $e');
+      // Fallback to generating random points
+      _generateMunichPoints();
+      setState(() {
+        _usingCachedData = false;
       });
     }
   }
@@ -2957,7 +3020,23 @@ class _MapPageState extends State<MapPage> {
                             ),
                       ),
                       const SizedBox(height: 4),
-                      Text('Munich points: ${_munichPoints.length}'),
+                      Text('Points: ${_munichPoints.length}'),
+                      if (_usingCachedData)
+                        Text(
+                          'Source: Cached database',
+                          style: TextStyle(
+                            color: Colors.green[700],
+                            fontWeight: FontWeight.bold,
+                          ),
+                        )
+                      else
+                        Text(
+                          'Source: Random Munich points',
+                          style: TextStyle(
+                            color: Colors.orange[700],
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       Text(
                         _userPosition != null
                             ? 'Your location: ${_userPosition!.latitude.toStringAsFixed(4)}, ${_userPosition!.longitude.toStringAsFixed(4)}'
@@ -2994,6 +3073,410 @@ class _MapPageState extends State<MapPage> {
   void dispose() {
     _hideTooltip();
     _mapController.dispose();
+    // Database will be closed automatically when disposed
+    super.dispose();
+  }
+}
+
+// ============================================================================
+// Data Loader Page
+// ============================================================================
+
+class DataLoaderPage extends StatefulWidget {
+  const DataLoaderPage({super.key});
+
+  @override
+  State<DataLoaderPage> createState() => _DataLoaderPageState();
+}
+
+class _DataLoaderPageState extends State<DataLoaderPage> {
+  AppDatabase? _database;
+  bool _isLoading = false;
+  bool _isGenerating = false;
+  int _pointsCount = 0;
+  String _databaseSize = 'Not created';
+  String _statusMessage = 'Ready to load data';
+  final math.Random _random = math.Random();
+
+  // Germany approximate bounds
+  static const double _germanyMinLat = 47.2;
+  static const double _germanyMaxLat = 55.1;
+  static const double _germanyMinLng = 5.9;
+  static const double _germanyMaxLng = 15.0;
+  static const int _targetPoints = 200000;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkDatabaseStatus();
+  }
+
+  Future<void> _checkDatabaseStatus() async {
+    try {
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'data_points.db'));
+      
+      if (await file.exists()) {
+        _database = AppDatabase();
+        final count = await _database!.getDataPointCount();
+        final size = await file.length();
+        setState(() {
+          _pointsCount = count;
+          _databaseSize = _formatFileSize(size);
+          _statusMessage = 'Database exists with $count points';
+        });
+      }
+    } catch (e) {
+      debugPrint('Error checking database status: $e');
+    }
+  }
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(2)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _generateRandomId() {
+    final int randomNum = _random.nextInt(999999);
+    return 'DP-${randomNum.toString().padLeft(6, '0')}';
+  }
+
+  Future<void> _generateAndLoadData() async {
+    if (_isLoading || _isGenerating) return;
+
+    setState(() {
+      _isGenerating = true;
+      _isLoading = true;
+      _statusMessage = 'Creating database...';
+    });
+
+    try {
+      // Create database
+      _database = AppDatabase();
+      
+      // Clear existing data
+      await _database!.clearAllDataPoints();
+
+      setState(() {
+        _statusMessage = 'Generating 200,000 random points in Germany...';
+      });
+
+      // Generate points in batches for better performance
+      const int batchSize = 5000;
+      final List<DataPointsCompanion> points = [];
+      int generated = 0;
+
+      for (int i = 0; i < _targetPoints; i++) {
+        // Generate random point within Germany bounds
+        final double lat = _germanyMinLat + 
+            (_random.nextDouble() * (_germanyMaxLat - _germanyMinLat));
+        final double lng = _germanyMinLng + 
+            (_random.nextDouble() * (_germanyMaxLng - _germanyMinLng));
+
+        final String id = _generateRandomId();
+
+        points.add(DataPointsCompanion.insert(
+          latitude: lat,
+          longitude: lng,
+          pointId: id,
+        ));
+
+        generated++;
+
+        // Insert in batches
+        if (points.length >= batchSize) {
+          await _database!.insertDataPoints(points);
+          points.clear();
+          
+          if (mounted) {
+            setState(() {
+              _statusMessage = 'Generated $generated / $_targetPoints points...';
+            });
+          }
+        }
+      }
+
+      // Insert remaining points
+      if (points.isNotEmpty) {
+        await _database!.insertDataPoints(points);
+      }
+
+      // Get final count and file size
+      final count = await _database!.getDataPointCount();
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'data_points.db'));
+      final size = await file.length();
+
+      if (mounted) {
+        setState(() {
+          _pointsCount = count;
+          _databaseSize = _formatFileSize(size);
+          _statusMessage = 'Successfully loaded $count points!';
+          _isGenerating = false;
+          _isLoading = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Database created successfully! Size: $_databaseSize'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error generating data: $e');
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Error: $e';
+          _isGenerating = false;
+          _isLoading = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error loading data: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _loadCachedData() async {
+    if (_isLoading) return;
+
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Loading cached data...';
+    });
+
+    try {
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'data_points.db'));
+
+      if (!await file.exists()) {
+        if (mounted) {
+          setState(() {
+            _statusMessage = 'No cached data found. Please generate data first.';
+            _isLoading = false;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No cached data found. Please generate data first.')),
+          );
+        }
+        return;
+      }
+
+      _database = AppDatabase();
+      final count = await _database!.getDataPointCount();
+      final size = await file.length();
+
+      if (mounted) {
+        setState(() {
+          _pointsCount = count;
+          _databaseSize = _formatFileSize(size);
+          _statusMessage = 'Cached data loaded: $count points';
+          _isLoading = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Loaded $count points from cache. Size: $_databaseSize'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error loading cached data: $e');
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Error loading data: $e';
+          _isLoading = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error loading data: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _clearDatabase() async {
+    if (_database == null) return;
+
+    try {
+      await _database!.clearAllDataPoints();
+      final dbFolder = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dbFolder.path, 'data_points.db'));
+      
+      if (await file.exists()) {
+        await file.delete();
+      }
+
+      if (mounted) {
+        setState(() {
+          _pointsCount = 0;
+          _databaseSize = 'Not created';
+          _statusMessage = 'Database cleared';
+          _database = null;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Database cleared successfully')),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error clearing database: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error clearing database: $e')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Data Loader'),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Status card
+            Card(
+              elevation: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Status',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.bold,
+                          ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _statusMessage,
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: _isGenerating ? Colors.blue : Colors.grey[700],
+                      ),
+                    ),
+                    if (_isGenerating) ...[
+                      const SizedBox(height: 16),
+                      const LinearProgressIndicator(),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Database info card
+            Card(
+              elevation: 4,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Database Information',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                            fontWeight: FontWeight.bold,
+                          ),
+                    ),
+                    const SizedBox(height: 12),
+                    _buildInfoRow('Points Count', '$_pointsCount'),
+                    _buildInfoRow('Database Size', _databaseSize),
+                    _buildInfoRow('Target Size', '~50 MB'),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+
+            // Action buttons
+            ElevatedButton.icon(
+              onPressed: (_isLoading || _isGenerating) ? null : _generateAndLoadData,
+              icon: _isGenerating
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.storage),
+              label: Text(_isGenerating ? 'Generating...' : 'Generate & Load Data'),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.all(16),
+                textStyle: const TextStyle(fontSize: 16),
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: (_isLoading || _isGenerating) ? null : _loadCachedData,
+              icon: _isLoading && !_isGenerating
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.download),
+              label: const Text('Load Cached Data'),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.all(16),
+                textStyle: const TextStyle(fontSize: 16),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (_pointsCount > 0)
+              OutlinedButton.icon(
+                onPressed: (_isLoading || _isGenerating) ? null : _clearDatabase,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Clear Database'),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.all(16),
+                  textStyle: const TextStyle(fontSize: 16),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            '$label:',
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              color: Colors.grey[700],
+            ),
+          ),
+          Text(
+            value,
+            style: const TextStyle(
+              fontWeight: FontWeight.w500,
+              fontSize: 16,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _database = null;
     super.dispose();
   }
 }
